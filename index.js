@@ -57,7 +57,7 @@ app.get('/code', async (req, res) => {
       let pairingCode = null;
       let sessionId = null;
       let socket = null;
-      let responsesent = false;
+      let responseSent = false;
       const connectionTimeout = setTimeout(() => {
         if (!responseSent && socket) {
           responseSent = true;
