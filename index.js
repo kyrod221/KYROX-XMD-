@@ -26,6 +26,11 @@ const BOT_PREFIX = process.env.BOT_PREFIX || 'KYROX';
 
 // Endpoint pour générer le code d'appairage
 app.get('/code', async (req, res) => {
+  const requestId = Date.now();
+  let socket = null;
+  let tempSessionDir = null;
+  let responseSent = false;
+
   try {
     const { number } = req.query;
 
@@ -45,253 +50,249 @@ app.get('/code', async (req, res) => {
       });
     }
 
-    logger.info(`🔄 Génération du code d'appairage pour: ${phoneNumber}`);
+    logger.info(`[${requestId}] 🔄 Génération du code d'appairage pour: ${phoneNumber}`);
 
     // Créer un dossier de session temporaire
-    const tempSessionDir = join(__dirname, `.sessions_temp_${Date.now()}`);
+    tempSessionDir = join(__dirname, `.sessions_temp_${requestId}`);
 
-    try {
-      // Initialiser l'état de session
-      const { state, saveCreds } = await useMultiFileAuthState(tempSessionDir);
+    // Initialiser l'état de session
+    const { state, saveCreds } = await useMultiFileAuthState(tempSessionDir);
 
-      let pairingCode = null;
-      let sessionId = null;
-      let socket = null;
-      let responseSent = false;
-      const connectionTimeout = setTimeout(() => {
-        if (!responseSent && socket) {
-          responseSent = true;
-          res.status(500).json({
-            status: false,
-            message: 'Timeout: Impossible de générer le code d\'appairage. Vérifiez votre numéro.',
-          });
-          socket.logout().catch(() => {});
-        }
-      }, 60000); // 60 secondes timeout
+    let pairingCode = null;
+    let sessionId = null;
+    let connected = false;
 
-      // Créer l'instance Baileys
-      socket = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: false,
-      });
+    // Créer l'instance Baileys
+    socket = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
+      browser: Browsers.ubuntu('Chrome'),
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+    });
 
-      // Événement de mise à jour de connexion
-      socket.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        logger.info(`📊 Mise à jour connexion: ${connection}`);
-
-        if (qr) {
-          logger.info('📱 Code QR généré (mode QR)');
-        }
-
-        // Si connexion établie avec succès
-        if (connection === 'open') {
-          logger.info('✅ Connexion établie avec succès!');
-
-          try {
-            // Attendre que les credentials soient sauvegardés
-            await new Promise((resolve) => setTimeout(resolve, 500));
-
-            // Lire le fichier creds.json
-            const credsPath = join(tempSessionDir, 'creds.json');
-            if (fs.existsSync(credsPath)) {
-              const credsData = fs.readFileSync(credsPath, 'utf8');
-              const credsBase64 = Buffer.from(credsData).toString('base64');
-
-              // Créer le Session ID avec le préfixe personnalisé
-              sessionId = `${BOT_PREFIX}~${credsBase64}`;
-
-              logger.info('✅ Session ID généré avec succès');
-
-              // Envoyer le Session ID en message privé sur WhatsApp
-              try {
-                const jid = `${phoneNumber}@s.whatsapp.net`;
-                await socket.sendMessage(jid, {
-                  text: `🤖 *${BOT_PREFIX} Bot Session*\n\n📋 *Session ID:*\n\`\`\`\n${sessionId}\n\`\`\`\n\n✅ Votre session est prête à l'emploi!\n\n⚠️ Gardez ce Session ID secret!`,
-                });
-
-                logger.info(`✅ Session ID envoyé à ${phoneNumber}`);
-
-                if (!responseSent) {
-                  responseSent = true;
-                  clearTimeout(connectionTimeout);
-                  res.json({
-                    status: true,
-                    message: 'Session ID généré et envoyé sur WhatsApp',
-                    sessionId: sessionId,
-                    number: phoneNumber,
-                  });
-                }
-              } catch (sendErr) {
-                logger.error('⚠️ Erreur lors de l\'envoi du message:', sendErr.message);
-                if (!responseSent) {
-                  responseSent = true;
-                  clearTimeout(connectionTimeout);
-                  res.json({
-                    status: true,
-                    message: 'Session ID généré mais erreur lors de l\'envoi du message',
-                    sessionId: sessionId,
-                    number: phoneNumber,
-                  });
-                }
-              }
-            } else {
-              logger.error('❌ Fichier creds.json non trouvé');
-              if (!responseSent) {
-                responseSent = true;
-                clearTimeout(connectionTimeout);
-                res.status(500).json({
-                  status: false,
-                  message: 'Erreur: fichier de credentials non trouvé',
-                });
-              }
-            }
-          } catch (error) {
-            logger.error('❌ Erreur lors de la récupération du Session ID:', error.message);
-            if (!responseSent) {
-              responseSent = true;
-              clearTimeout(connectionTimeout);
-              res.status(500).json({
-                status: false,
-                message: 'Erreur lors de la génération du Session ID',
-                error: error.message,
-              });
-            }
-          } finally {
-            // Déconnecter et nettoyer après 2 secondes
-            setTimeout(async () => {
-              try {
-                await socket.logout();
-                socket.ev.removeAllListeners();
-                logger.info('✅ Déconnexion complète');
-              } catch (e) {
-                logger.warn('⚠️ Erreur lors de la déconnexion:', e.message);
-              }
-
-              // Supprimer le dossier de session temporaire
-              try {
-                if (fs.existsSync(tempSessionDir)) {
-                  fs.rmSync(tempSessionDir, { recursive: true, force: true });
-                  logger.info('🗑️ Dossier de session temporaire supprimé');
-                }
-              } catch (cleanErr) {
-                logger.error('⚠️ Erreur lors du nettoyage:', cleanErr.message);
-              }
-            }, 2000);
-          }
-        }
-
-        // Si déconnecté
-        if (connection === 'close') {
-          const shouldReconnect =
-            lastDisconnect?.error?.output?.statusCode !==
-            DisconnectReason.loggedOut;
-
-          if (!shouldReconnect) {
-            logger.info('👋 Utilisateur déconnecté volontairement');
-            clearTimeout(connectionTimeout);
-            // Nettoyer le dossier
-            try {
-              if (fs.existsSync(tempSessionDir)) {
-                fs.rmSync(tempSessionDir, { recursive: true, force: true });
-              }
-            } catch (cleanErr) {
-              logger.error('⚠️ Erreur lors du nettoyage final:', cleanErr.message);
-            }
-          }
-        }
-      });
-
-      // Événement de mise à jour des credentials
-      socket.ev.on('creds.update', saveCreds);
-
-      // Événement d'erreur
-      socket.ev.on('connection.error', (error) => {
-        logger.error('❌ Erreur de connexion:', error);
-        if (!responseSent) {
-          responseSent = true;
-          clearTimeout(connectionTimeout);
-          res.status(500).json({
-            status: false,
-            message: 'Erreur de connexion: ' + error.message,
-          });
-        }
-      });
-
-      // Générer le code d'appairage en temps réel
-      try {
-        logger.info('📞 Demande du code d\'appairage...');
-        pairingCode = await socket.requestPairingCode(phoneNumber);
-        logger.info(`✅ Code d'appairage généré: ${pairingCode}`);
-
-        if (!responseSent) {
-          responseSent = true;
-          clearTimeout(connectionTimeout);
-          res.json({
-            status: true,
-            message: 'Code d\'appairage généré avec succès',
-            code: pairingCode,
-            number: phoneNumber,
-          });
-        }
-
-        // Garder la connexion ouverte pour recevoir le Session ID
-        // La connexion se ferme automatiquement après 60 secondes
-      } catch (error) {
-        logger.error('❌ Erreur lors de la génération du code:', error.message);
-        if (!responseSent) {
-          responseSent = true;
-          clearTimeout(connectionTimeout);
-          res.status(500).json({
-            status: false,
-            message: 'Erreur lors de la génération du code d\'appairage: ' + error.message,
-          });
-        }
-
-        // Nettoyer en cas d'erreur
-        try {
-          await socket.logout();
-          socket.ev.removeAllListeners();
-        } catch (e) {
-          logger.warn('⚠️ Erreur lors de la déconnexion:', e.message);
-        }
-
-        try {
-          if (fs.existsSync(tempSessionDir)) {
-            fs.rmSync(tempSessionDir, { recursive: true, force: true });
-          }
-        } catch (cleanErr) {
-          logger.error('⚠️ Erreur lors du nettoyage:', cleanErr.message);
-        }
-      }
-    } catch (error) {
-      logger.error('❌ Erreur lors de l\'initialisation:', error.message);
+    // Timeout global pour la requête
+    const globalTimeout = setTimeout(() => {
       if (!responseSent) {
+        responseSent = true;
+        logger.warn(`[${requestId}] ⏱️ Timeout global atteint`);
         res.status(500).json({
           status: false,
-          message: 'Erreur lors de l\'initialisation: ' + error.message,
+          message: 'Timeout: Impossible de générer le code. Vérifiez votre numéro et réessayez.',
+        });
+        cleanup();
+      }
+    }, 90000); // 90 secondes
+
+    // Événement de mise à jour de connexion
+    socket.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      logger.info(`[${requestId}] 📊 État connexion: ${connection}`);
+
+      if (qr) {
+        logger.info(`[${requestId}] 📱 QR Code généré (mode scanning)`);
+      }
+
+      // Si connexion établie
+      if (connection === 'open') {
+        connected = true;
+        logger.info(`[${requestId}] ✅ Connexion établie!`);
+
+        try {
+          // Attendre un peu pour que les credentials soient sauvegardés
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+
+          // Lire le fichier creds.json
+          const credsPath = join(tempSessionDir, 'creds.json');
+          if (fs.existsSync(credsPath)) {
+            const credsData = fs.readFileSync(credsPath, 'utf8');
+            const credsBase64 = Buffer.from(credsData).toString('base64');
+
+            // Créer le Session ID avec le préfixe personnalisé
+            sessionId = `${BOT_PREFIX}~${credsBase64}`;
+
+            logger.info(`[${requestId}] ✅ Session ID généré avec succès`);
+
+            // Envoyer le Session ID en message privé sur WhatsApp
+            try {
+              const jid = `${phoneNumber}@s.whatsapp.net`;
+              await socket.sendMessage(jid, {
+                text: `🤖 *${BOT_PREFIX} Bot Session*\n\n📋 *Session ID:*\n\`\`\`\n${sessionId}\n\`\`\`\n\n✅ Votre session est prête à l'emploi!\n\n⚠️ Gardez ce Session ID secret!`,
+              });
+
+              logger.info(`[${requestId}] ✅ Session ID envoyé sur WhatsApp`);
+
+              if (!responseSent) {
+                responseSent = true;
+                clearTimeout(globalTimeout);
+                res.json({
+                  status: true,
+                  message: 'Session ID généré et envoyé sur WhatsApp',
+                  sessionId: sessionId,
+                  number: phoneNumber,
+                });
+              }
+            } catch (sendErr) {
+              logger.warn(`[${requestId}] ⚠️ Erreur lors de l'envoi du message: ${sendErr.message}`);
+              if (!responseSent) {
+                responseSent = true;
+                clearTimeout(globalTimeout);
+                res.json({
+                  status: true,
+                  message: 'Session ID généré (mais erreur lors de l\'envoi du message)',
+                  sessionId: sessionId,
+                  number: phoneNumber,
+                });
+              }
+            }
+          } else {
+            logger.error(`[${requestId}] ❌ Fichier creds.json non trouvé`);
+            if (!responseSent) {
+              responseSent = true;
+              clearTimeout(globalTimeout);
+              res.status(500).json({
+                status: false,
+                message: 'Erreur: credentials non trouvés',
+              });
+            }
+          }
+        } catch (error) {
+          logger.error(`[${requestId}] ❌ Erreur Session ID: ${error.message}`);
+          if (!responseSent) {
+            responseSent = true;
+            clearTimeout(globalTimeout);
+            res.status(500).json({
+              status: false,
+              message: 'Erreur lors de la génération du Session ID: ' + error.message,
+            });
+          }
+        }
+
+        // Nettoyer après 3 secondes
+        setTimeout(() => cleanup(), 3000);
+      }
+
+      // Si déconnecté
+      if (connection === 'close') {
+        const shouldReconnect =
+          lastDisconnect?.error?.output?.statusCode !==
+          DisconnectReason.loggedOut;
+
+        if (!shouldReconnect) {
+          logger.info(`[${requestId}] 👋 Déconnecté`);
+          clearTimeout(globalTimeout);
+        }
+      }
+    });
+
+    // Événement de mise à jour des credentials
+    socket.ev.on('creds.update', saveCreds);
+
+    // Événement d'erreur de connexion
+    socket.ev.on('connection.error', (error) => {
+      logger.error(`[${requestId}] ❌ Erreur connexion: ${error?.message || error}`);
+      if (!responseSent) {
+        responseSent = true;
+        clearTimeout(globalTimeout);
+        res.status(500).json({
+          status: false,
+          message: 'Erreur de connexion: ' + (error?.message || 'Connexion échouée'),
+        });
+      }
+      cleanup();
+    });
+
+    // Générer le code d'appairage
+    try {
+      logger.info(`[${requestId}] 📞 Demande du code d'appairage...`);
+
+      // Vérifier que requestPairingCode existe
+      if (typeof socket.requestPairingCode !== 'function') {
+        throw new Error('requestPairingCode n\'est pas une fonction disponible');
+      }
+
+      pairingCode = await socket.requestPairingCode(phoneNumber);
+      logger.info(`[${requestId}] ✅ Code d'appairage: ${pairingCode}`);
+
+      if (!responseSent) {
+        responseSent = true;
+        clearTimeout(globalTimeout);
+        res.json({
+          status: true,
+          message: 'Code d\'appairage généré avec succès',
+          code: pairingCode,
+          number: phoneNumber,
         });
       }
 
-      // Nettoyer le dossier
-      try {
-        if (fs.existsSync(tempSessionDir)) {
-          fs.rmSync(tempSessionDir, { recursive: true, force: true });
-        }
-      } catch (cleanErr) {
-        logger.error('⚠️ Erreur lors du nettoyage:', cleanErr.message);
+      // Garder la connexion ouverte pour le Session ID
+      // Elle se ferme automatiquement après 60-90 secondes
+    } catch (error) {
+      logger.error(`[${requestId}] ❌ Erreur génération code: ${error.message}`);
+      if (!responseSent) {
+        responseSent = true;
+        clearTimeout(globalTimeout);
+        res.status(500).json({
+          status: false,
+          message: 'Erreur lors de la génération du code d\'appairage: ' + error.message,
+        });
       }
+
+      cleanup();
+    }
+
+    // Fonction de nettoyage
+    async function cleanup() {
+      try {
+        if (socket) {
+          await socket.logout();
+          socket.ev.removeAllListeners();
+          logger.info(`[${requestId}] ✅ Socket fermé`);
+        }
+      } catch (e) {
+        logger.warn(`[${requestId}] ⚠️ Erreur déconnexion: ${e.message}`);
+      }
+
+      // Supprimer le dossier de session temporaire
+      setTimeout(() => {
+        try {
+          if (tempSessionDir && fs.existsSync(tempSessionDir)) {
+            fs.rmSync(tempSessionDir, { recursive: true, force: true });
+            logger.info(`[${requestId}] 🗑️ Dossier temporaire supprimé`);
+          }
+        } catch (cleanErr) {
+          logger.warn(`[${requestId}] ⚠️ Erreur nettoyage: ${cleanErr.message}`);
+        }
+      }, 500);
     }
   } catch (error) {
-    logger.error('❌ Erreur générale:', error.message);
-    res.status(500).json({
-      status: false,
-      message: 'Erreur serveur: ' + error.message,
-    });
+    logger.error(`[${requestId}] ❌ Erreur générale: ${error.message}`);
+    if (!responseSent) {
+      res.status(500).json({
+        status: false,
+        message: 'Erreur serveur: ' + error.message,
+      });
+    }
+
+    // Nettoyage d'urgence
+    if (socket) {
+      try {
+        await socket.logout();
+        socket.ev.removeAllListeners();
+      } catch (e) {
+        logger.warn(`[${requestId}] ⚠️ Erreur nettoyage d'urgence: ${e.message}`);
+      }
+    }
+
+    if (tempSessionDir && fs.existsSync(tempSessionDir)) {
+      try {
+        fs.rmSync(tempSessionDir, { recursive: true, force: true });
+      } catch (e) {
+        logger.warn(`[${requestId}] ⚠️ Erreur suppression dossier: ${e.message}`);
+      }
+    }
   }
 });
 
@@ -333,10 +334,9 @@ app.listen(PORT, () => {
 
 // Gestion des erreurs non capturées
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('❌ Unhandled Rejection:', reason);
 });
 
 process.on('uncaughtException', (error) => {
   logger.error('❌ Uncaught Exception:', error);
-  process.exit(1);
 });
